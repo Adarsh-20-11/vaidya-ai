@@ -23,11 +23,14 @@ from tests.fixtures.generate_fixtures import (
     make_stock_sales_fixture,
     make_ledger_fixture,
     make_snapshots_fixture,
+    make_daybook_fixture,
 )
 from pipeline.parsers.stock_parser import StockParser
 from pipeline.parsers.sales_parser import SalesParser
 from pipeline.parsers.ledger_parser import LedgerParser
+from pipeline.parsers.daybook_parser import DaybookParser
 from pipeline.transformers.stock_transformer import StockTransformer
+from pipeline.transformers.daybook_transformer import DaybookTransformer
 from pipeline.loaders.local_loader import LocalLoader
 
 
@@ -114,6 +117,50 @@ class TestFullLedgerPipeline(unittest.TestCase):
         if result.data is not None and not result.data.empty:
             path = loader.save("ledger", result.data, str(self.report_date))
             self.assertTrue(Path(path).exists())
+
+
+class TestFullDaybookPipeline(unittest.TestCase):
+    """Parse daybook → transform (split SALE/PURC) → save locally."""
+
+    def setUp(self):
+        self.report_date = date(2026, 5, 10)
+        self.daybook_file = make_daybook_fixture()
+        self.tmp_dir = tempfile.mkdtemp()
+
+    def test_daybook_parse_then_split_then_save(self):
+        # Parse
+        parser = DaybookParser()
+        parse_result = parser.parse(self.daybook_file, self.report_date)
+        self.assertTrue(parse_result.success,
+                        f"Daybook parse failed: {parse_result.errors}")
+
+        # Transform (split into sales + purchases + new items)
+        transformer = DaybookTransformer()
+        split = transformer.transform(parse_result.data)
+
+        # All three tables should have content from fixture
+        self.assertFalse(split.sales_entries.empty)
+        self.assertFalse(split.purchase_entries.empty)
+        self.assertFalse(split.new_items.empty)
+
+        # Save all three to local CSVs
+        loader = LocalLoader(output_dir=self.tmp_dir)
+        sales_path = loader.save("sales_entries", split.sales_entries, str(self.report_date))
+        purchase_path = loader.save("purchase_entries", split.purchase_entries, str(self.report_date))
+        items_path = loader.save("stock_items_new", split.new_items, str(self.report_date))
+
+        for p in [sales_path, purchase_path, items_path]:
+            self.assertTrue(Path(p).exists(), f"Missing output: {p}")
+
+    def test_daybook_idempotent(self):
+        """Running daybook parse twice produces identical output."""
+        parser = DaybookParser()
+        r1 = parser.parse(self.daybook_file, self.report_date)
+        r2 = parser.parse(self.daybook_file, self.report_date)
+
+        self.assertEqual(r1.success, r2.success)
+        self.assertEqual(r1.row_count, r2.row_count)
+        self.assertEqual(r1.file_hash, r2.file_hash)
 
 
 class TestPipelineIdempotency(unittest.TestCase):

@@ -8,16 +8,19 @@ Usage:
   python run_pipeline.py --report all
   python run_pipeline.py --report stock
   python run_pipeline.py --report ledger
+  python run_pipeline.py --report daybook
   python run_pipeline.py --report all --dry-run
   python run_pipeline.py --report stock --file ./exports/stock_20260510.xlsx
+  python run_pipeline.py --report daybook --file ./exports/daybook_april.csv
 
 Pipeline order (important — don't change without understanding dependencies):
   1. stock_current  → stock_items + stock_snapshots
   2. stock_sales    → stock_snapshots (movement data)
-  3. ledger         → party_ledger_entries
-  4. purchase_reg   → purchase_entries
-  5. sales_reg      → sales_entries
-  6. TRANSFORM      → item_velocity, item_health, anomalies_today, supplier_intelligence
+  3. item_daybook   → sales_entries + purchase_entries + stock_items (new items)
+  4. ledger         → party_ledger_entries
+  5. purchase_reg   → purchase_entries  (alternate source if daybook unavailable)
+  6. sales_reg      → sales_entries     (alternate source if daybook unavailable)
+  7. TRANSFORM      → item_velocity, item_health, anomalies_today, supplier_intelligence
 """
 
 import argparse
@@ -33,7 +36,9 @@ from config.settings import pipeline_config, supabase_config
 from pipeline.parsers.stock_parser import StockParser
 from pipeline.parsers.ledger_parser import LedgerParser
 from pipeline.parsers.sales_parser import SalesParser
+from pipeline.parsers.daybook_parser import DaybookParser
 from pipeline.transformers.stock_transformer import StockTransformer
+from pipeline.transformers.daybook_transformer import DaybookTransformer
 from pipeline.loaders.supabase_loader import SupabaseLoader
 from pipeline.loaders.local_loader import LocalLoader
 
@@ -175,6 +180,71 @@ def run_sales(file_path: str, dry_run: bool, report_date: Optional[date]) -> boo
     return True
 
 
+def run_daybook(file_path: str, dry_run: bool, report_date: Optional[date]) -> bool:
+    """
+    Item Day Book is the richest single export — it contains every SALE
+    and PURC line across all bills in a date range. Splits into both
+    sales_entries and purchase_entries.
+    """
+    logger.info("── Item Day Book ──")
+    parser = DaybookParser()
+    result = parser.parse(file_path, report_date)
+    logger.info(result.summary())
+
+    if not result.success:
+        for e in result.errors:
+            logger.error(f"  ERROR: {e}")
+        return False
+
+    for w in result.warnings:
+        logger.warning(f"  WARN: {w}")
+
+    # Split parsed records into destination tables
+    transformer = DaybookTransformer()
+    split = transformer.transform(result.data)
+
+    for w in split.warnings:
+        logger.info(f"  {w}")
+
+    if dry_run:
+        local = LocalLoader()
+        local.save("daybook_parsed", result.data, str(report_date))
+        local.save("daybook_sales", split.sales_entries, str(report_date))
+        local.save("daybook_purchases", split.purchase_entries, str(report_date))
+        local.save("daybook_new_items", split.new_items, str(report_date))
+        logger.info(f"  DRY RUN: saved 4 files locally")
+        return True
+
+    loader = SupabaseLoader()
+
+    # 1. Upsert new items into stock_items master
+    if not split.new_items.empty:
+        r = loader.upsert("stock_items", split.new_items, ["code"])
+        logger.info(f"  stock_items: {r.rows_upserted} upserted")
+
+    # 2. Upsert sales_entries
+    if not split.sales_entries.empty:
+        r = loader.upsert(
+            "sales_entries", split.sales_entries,
+            ["invoice_no", "item_code", "date"]
+        )
+        logger.info(f"  sales_entries: {r.rows_upserted} upserted")
+
+    # 3. Upsert purchase_entries
+    if not split.purchase_entries.empty:
+        r = loader.upsert(
+            "purchase_entries", split.purchase_entries,
+            ["invoice_no", "item_code", "date"]
+        )
+        logger.info(f"  purchase_entries: {r.rows_upserted} upserted")
+
+    loader.log_pipeline_run(
+        "item_daybook", file_path, result.file_hash,
+        result.row_count, result.success, result.errors, result.warnings
+    )
+    return True
+
+
 def run_transform(dry_run: bool) -> bool:
     """
     Pull latest snapshots from Supabase and compute intelligence tables.
@@ -220,7 +290,11 @@ def run_transform(dry_run: bool) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Vaidya-AI Data Pipeline")
-    parser.add_argument("--report", choices=["all", "stock", "ledger", "sales"], default="all")
+    parser.add_argument(
+        "--report",
+        choices=["all", "stock", "ledger", "sales", "daybook"],
+        default="all"
+    )
     parser.add_argument("--file", type=str, help="Specific file to process (optional)")
     parser.add_argument("--date", type=str, help="Report date YYYY-MM-DD (default: today)")
     parser.add_argument("--dry-run", action="store_true", help="Parse only, no Supabase writes")
@@ -236,15 +310,18 @@ def main():
     export_dir = Path(pipeline_config.export_dir)
     success = True
 
-    def find_file(prefix: str) -> Optional[str]:
+    def find_file(prefix: str, extensions: tuple = (".xlsx",)) -> Optional[str]:
+        """Find a matching file in export_dir. Defaults to .xlsx; daybook uses .csv."""
         if args.file:
             return args.file
-        # Look for file matching today's date or any xlsx in export dir
         date_str = report_date.strftime("%Y%m%d")
-        candidates = list(export_dir.glob(f"*{prefix}*{date_str}*.xlsx"))
-        if not candidates:
-            candidates = list(export_dir.glob(f"*{prefix}*.xlsx"))
-        return str(candidates[0]) if candidates else None
+        for ext in extensions:
+            candidates = list(export_dir.glob(f"*{prefix}*{date_str}*{ext}"))
+            if not candidates:
+                candidates = list(export_dir.glob(f"*{prefix}*{ext}"))
+            if candidates:
+                return str(candidates[0])
+        return None
 
     if args.report in ("all", "stock"):
         f = find_file("stock")
@@ -266,6 +343,14 @@ def main():
             success &= run_sales(f, dry_run, report_date)
         else:
             logger.info("No sales analysis file found (optional for today)")
+
+    if args.report in ("all", "daybook"):
+        # Daybook is CSV, not xlsx
+        f = find_file("daybook", extensions=(".csv",))
+        if f:
+            success &= run_daybook(f, dry_run, report_date)
+        else:
+            logger.info("No daybook file found (optional for today)")
 
     if args.report == "all":
         success &= run_transform(dry_run)

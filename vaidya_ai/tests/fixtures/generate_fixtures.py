@@ -88,6 +88,54 @@ def make_ledger_fixture() -> str:
     return str(path)
 
 
+def make_daybook_fixture() -> str:
+    """
+    Creates a daybook.csv fixture matching real Marg Item Day Book format.
+    Covers all the edge cases:
+      - Bill headers with various party-name/city formats
+      - Multiple items per bill
+      - SALE and PURC transactions
+      - 50+10 scheme quantities
+      - -BLANK- supplier
+      - Zero MRP (capital equipment)
+      - Concatenated party name + city (no space)
+      - Run-on bill number + party (NASA12345NATIONAL DRUG)
+      - Page break artifacts
+      - Missing batch/expiry fields
+    """
+    content = """ITEM DESCRIPTION,QUANTITY TYPE,RATE,M.R.P. COMPANY,AMOUNT BATCH & DETAIL
+10-04-2026 A000073     S S PHARMA,         GAYA,,,
+1242            ROMSONS Colostomy kit-Ad,      5 SALE,151.42,325.00 ROMSONS,757.10 G25G010803           Jun 2030
+10-04-2026 A000074     DR PIYUSH RANJAN,         SASARAM,,,
+E43DBZ46        LENTECLIN IV 100MG INJ,     20 SALE,76.20,536.95 ARISTO CCD,1524.00 AB250580B            Sep 2027
+10-04-2026 A000075     OM MEDICAL HALL,         GAYA,,,
+A13EAE97        GROWZEST SYP      1*200M,  50+10 SALE,140.00,183.75 MEDVEY BIO,6510.00 HL-250597            Apr 2027
+10-04-2026 A000078     ARSH MEDI TECH PRIVATE LIMITEDGAYA
+A13EAE37        BIO BFS GLYCIN 3L 1*4,      4 SALE,123.55,697.00 BIOSYNERGY,494.20 PGI25006             Aug 2027
+00096           NS 3LTR FFS       1X4,     12 SALE,105.00,630.00 -BLANK-,1260.00 NSTA24002            Sep 2026
+11-04-2026 A000079     SUMAN ENTERPRISES,         GAYA,,,
+A00177          MERILYZER CELQUAN 1*1,      1 SALE,152250.00, 0.00 MERIL DIAG,152250.00 C3250636
+11-04-2026 NASA26270007NATIONAL DRUG,AGENCIES        PATNA,,,
+00039           ANAWIN HEAVY 4ML  1*25 A,    250 PURC,22.54,31.47 NEON,5635.00 KP1713908            Oct 2027
+1504            MYO PYROLATE      1*25 A,     75 PURC,57.15,127.48 NEON,4286.25 V350477              Oct 2027
+11-04-2026 A000081     S S PHARMA,         GAYA,,,
+A13EAE114       PULSE OXIMETER CUROMED,      1 SALE,655.09,2099.00 CUROMED,655.09
+1801            BIOSAFE EXAMINATION GLOV,    400 SALE,1.95,14.42 CARTEL LIF,780.00 EGM25L02             Nov 2028
+,,,Continued..2,
+,,,,
+,,,,
+MAGADH WELLNESS PRIVATE LIMITED
+ITEM DAY BOOK FROM 10-04-2026 TO 10-05-2026,,  Page,No..2,
+ITEM DESCRIPTION,QUANTITY TYPE,RATE,M.R.P. COMPANY,AMOUNT BATCH & DETAIL
+12-04-2026 T000253     NOMA AGENCY,         PATNA,,,
+1201            MED.POP BAN 6"(PL 1*96,    192 PURC,46.43,300.00 MEDICARE,8914.56 4228                 Dec 2029
+"""
+    path = FIXTURE_DIR / "daybook.csv"
+    path.write_text(content, encoding="utf-8")
+    print(f"Created: {path}")
+    return str(path)
+
+
 def make_snapshots_fixture() -> pd.DataFrame:
     """
     Returns an in-memory DataFrame of multi-day snapshots for transformer tests.
@@ -138,4 +186,5 @@ if __name__ == "__main__":
     make_stock_current_fixture()
     make_stock_sales_fixture()
     make_ledger_fixture()
+    make_daybook_fixture()
     print("All fixtures generated.")

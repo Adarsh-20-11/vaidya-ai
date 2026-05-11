@@ -182,6 +182,45 @@ SALES_REGISTER_SCHEMA = ReportSchema(
 
 
 # ──────────────────────────────────────────────
+# ITEM DAY BOOK
+# Source: Marg Silver → Reports → Item Day Book
+# Shows BOTH sales (SALE) and purchases (PURC) per item per bill
+# in a paired-row format (bill header + N item rows).
+#
+# Unlike other schemas, the columns listed here describe the
+# PARSED output, not the raw input. The raw input has 5 generic
+# columns; the parser unpacks them into these fields.
+# ──────────────────────────────────────────────
+ITEM_DAYBOOK_SCHEMA = ReportSchema(
+    report_id="item_daybook",
+    display_name="Item Day Book",
+    description="Per-item record of every sale and purchase line across all bills "
+                "in a date range. Single source of truth for transactional data.",
+    columns=[
+        ColumnSpec("date",             "date",  required=True),
+        ColumnSpec("bill_no",          "str",   required=True),
+        ColumnSpec("party_name",       "str",   required=True),
+        ColumnSpec("city",             "str",   required=False),
+        ColumnSpec("transaction_type", "str",   required=True),  # 'SALE' or 'PURC'
+        ColumnSpec("item_code",        "str",   required=True),
+        ColumnSpec("item_name",        "str",   required=True),
+        ColumnSpec("qty",              "float", required=True),
+        ColumnSpec("unit_pack",        "str",   required=False),
+        ColumnSpec("rate",             "float", required=False),
+        ColumnSpec("mrp",              "float", required=False),
+        ColumnSpec("company",          "str",   required=False),
+        ColumnSpec("amount",           "float", required=False),
+        ColumnSpec("batch_no",         "str",   required=False),
+        ColumnSpec("expiry",           "str",   required=False),
+    ],
+    notes="Raw format is paired-row (bill header + N item rows). "
+          "Parser handles the multi-row state machine internally. "
+          "Output is one row per item transaction. "
+          "'SALE' rows feed sales_entries table; 'PURC' rows feed purchase_entries."
+)
+
+
+# ──────────────────────────────────────────────
 # REGISTRY — add new schemas here
 # ──────────────────────────────────────────────
 REPORT_SCHEMAS: Dict[str, ReportSchema] = {
@@ -190,6 +229,7 @@ REPORT_SCHEMAS: Dict[str, ReportSchema] = {
     "ledger":             LEDGER_SCHEMA,
     "purchase_register":  PURCHASE_REGISTER_SCHEMA,
     "sales_register":     SALES_REGISTER_SCHEMA,
+    "item_daybook":       ITEM_DAYBOOK_SCHEMA,
 }
 
 

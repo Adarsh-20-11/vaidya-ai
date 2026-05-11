@@ -83,6 +83,15 @@ class BusinessRules:
         "-BLANK-", "BLANK", "", "ZZZZZ Z 100", "0", None
     ])
 
+    # Known cities for parsing Item Day Book bill headers
+    # (where city is sometimes concatenated with party name without delimiter)
+    # Magadh Wellness operates primarily in Bihar — add more as needed
+    known_cities: list = field(default_factory=lambda: [
+        "GAYA", "PATNA", "SASARAM", "NAWADA", "AURANGABAD",
+        "NALANDA", "BODH GAYA", "JEHANABAD", "ARWAL",
+        "GAYA JI", "RAFIGANJ", "SHERGHATI", "TIKARI", "BARH",
+    ])
+
 
 # Singleton instances — import these directly
 supabase_config = SupabaseConfig()
