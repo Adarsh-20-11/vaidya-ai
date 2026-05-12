@@ -70,6 +70,12 @@ from tools.supplier_tools import (
     get_anomalies,
     draft_vendor_message,
 )
+from tools.customer_tools import (
+    get_customer_discounts,
+    get_item_rate_variance,
+    compare_customer_rates,
+    get_below_cost_sales,
+)
 from resources.brief_resource import (
     get_daily_brief_content,
     get_pipeline_status_content,
@@ -83,20 +89,34 @@ mcp = FastMCP(
 You are Vaidya-AI, business intelligence assistant for Magadh Wellness 
 Private Limited, a pharma and surgical equipment distributor in Gaya, Bihar.
 
-AVAILABLE TOOLS (use in this order for best results):
-1. get_anomalies()         — Start here for morning brief or 'what's wrong today'
-2. get_stock_status()      — Stock health overview, filter by urgency
-3. get_item_velocity()     — Deep dive on a specific item
-4. get_supplier_info()     — Supplier rates and trends
-5. get_margin_alerts()     — Items with eroding profitability
-6. get_dead_stock()        — Capital locked in slow-moving inventory
-7. search_item()           — Find item code from partial name
-8. draft_vendor_message()  — Generate order message (owner must confirm)
+AVAILABLE TOOLS:
+
+STOCK & SUPPLIER (use first for operational questions):
+1. anomalies()          — Start here for morning brief or 'kya problem hai aaj'
+2. stock_status()       — Stock health overview, filter by urgency
+3. item_velocity()      — Deep dive on a specific item
+4. supplier_info()      — Supplier rates and trends
+5. margin_alerts()      — Items with eroding profitability
+6. dead_stock()         — Capital locked in slow-moving inventory
+7. find_item()          — Find item code from partial name
+8. vendor_message_draft() — Generate order message (owner must confirm)
+
+CUSTOMER TIER (use for pricing/customer-rate questions):
+9.  customer_discounts()           — Who gets the best discounts and how much
+10. item_rate_variance()           — Items with inconsistent pricing
+11. compare_rates_across_customers() — Side-by-side pricing for one item
+12. below_cost_sales()             — Sales that lost money
 
 RESOURCES:
 - vaidya://brief/today     — Today's pre-generated brief
 - vaidya://pipeline/status — Data freshness and pipeline health
 - vaidya://schema/summary  — Database schema (for advanced queries)
+
+DECISION FLOW:
+- 'What's wrong today?'           → anomalies() + stock_status()
+- 'Who pays the most/least?'      → customer_discounts() or compare_rates_across_customers()
+- 'Are we losing money anywhere?' → below_cost_sales() + margin_alerts()
+- 'Are we pricing consistently?'  → item_rate_variance()
 
 Always check pipeline/status if data seems stale or incomplete.
 """.strip()
@@ -200,6 +220,78 @@ def vendor_message_draft(
         last_rate=last_rate,
         notes=notes
     )
+
+
+# ────────────────────────────────────────────
+# CUSTOMER TIER & DISCOUNT TOOLS
+# ────────────────────────────────────────────
+
+@mcp.tool()
+def customer_discounts(
+    customer_name: str = None,
+    min_discount_pct: float = 1.0,
+    limit: int = 20
+) -> dict:
+    """
+    Find customers who receive discounts on their purchases, ranked by average %.
+    Discount = (qty × rate − billed_amount) / (qty × rate) × 100
+    Use when the owner asks who gets the best rates, who pays full price,
+    or wants to compare customer profitability.
+    Pass customer_name (partial match ok) to focus on one party.
+    """
+    return get_customer_discounts(
+        customer_name=customer_name,
+        min_discount_pct=min_discount_pct,
+        limit=limit
+    )
+
+
+@mcp.tool()
+def item_rate_variance(
+    item_code: str = None,
+    min_customers: int = 3,
+    limit: int = 20
+) -> dict:
+    """
+    Find items sold at significantly different rates to different customers.
+    Highlights inconsistent pricing or customer-tier rate negotiation.
+    Use when owner asks 'are we pricing the same item differently?'
+    or wants to identify products with unclear pricing strategy.
+    """
+    return get_item_rate_variance(
+        item_code=item_code,
+        min_customers=min_customers,
+        limit=limit
+    )
+
+
+@mcp.tool()
+def compare_rates_across_customers(
+    item_code: str,
+    customer_names: list = None
+) -> dict:
+    """
+    Compare what each customer pays for a SPECIFIC item.
+    Use when owner asks 'what does Hospital X pay for Amikacin vs others?'
+    or is preparing for a customer-specific price negotiation.
+    Call find_item() first if you only have a product name.
+    Optionally filter to a few customer name fragments via customer_names list.
+    """
+    return compare_customer_rates(
+        item_code=item_code,
+        customer_names=customer_names
+    )
+
+
+@mcp.tool()
+def below_cost_sales(limit: int = 20) -> dict:
+    """
+    Find sales where customer paid LESS than the item's purchase cost.
+    These transactions lost money. Use when owner asks if anything
+    is being sold at a loss, or for a margin erosion investigation.
+    Returns transactions sorted by total loss value (worst first).
+    """
+    return get_below_cost_sales(limit=limit)
 
 
 # ────────────────────────────────────────────

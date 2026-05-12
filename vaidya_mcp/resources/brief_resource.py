@@ -160,8 +160,19 @@ TRANSACTION TABLES:
   party_ledger_entries  Financial transactions per party.
                         party_name, date, debit, credit, balance,
                         is_overdue, days_outstanding
-  purchase_entries      Purchase invoices. vendor_name, item_name, qty, rate
-  sales_entries         Sales invoices. customer_name, item_name, qty, rate
+  purchase_entries      Purchase invoices.
+                        vendor_name, item_name, qty, rate, amount,
+                        discount_pct (% off qty×rate),
+                        category (purchase | stock_in | purchase_return)
+  sales_entries         Sales invoices.
+                        customer_name, item_name, qty, rate, amount, mrp,
+                        discount_pct (% off qty×rate),
+                        category (retail | wholesale | sales_return | replacement)
+
+KEY FIELDS FOR CUSTOMER INTELLIGENCE:
+  sales_entries.discount_pct  → how much was knocked off list price
+  sales_entries.category      → distinguishes retail from wholesale stock-loan
+  Same customer + same item with varying rates = customer-tier pricing signal
 
 INTELLIGENCE TABLES (nightly computed):
   item_velocity      avg_daily_sales_7d/30d/90d, velocity_trend, confidence
@@ -183,5 +194,6 @@ SYSTEM TABLES:
 DATA FRESHNESS:
   stock_snapshots:   Updated daily (requires manual export from Marg Silver)
   Intelligence tables: Recomputed nightly after sync
+  Sales/purchase:    Updated when Item Day Book is ingested
   Ledger data:       Updated when ledger export is performed (weekly recommended)
 """.strip()

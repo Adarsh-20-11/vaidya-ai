@@ -58,8 +58,21 @@ _BILL_NO_PATTERN = re.compile(r"^([A-Z]+\d+)")
 
 # Item quantity + transaction type
 # "75 SALE", "250 PURC", "50+10 SALE" (where 50 is sold qty, 10 is free)
+# Real transaction types observed in Marg Item Day Book exports:
+#   SALE  → retail sale to customer
+#   PURC  → purchase from vendor
+#   ST.L  → stock loan outward (to fellow medical store, wholesale rate)
+#   ST.I  → stock transfer inward
+#   SRET  → sales return (long form)
+#   PRET  → purchase return (long form)
+#   S/R   → sales return (short form, paired with CN-prefix bill)
+#   P/R   → purchase return (short form, return to vendor)
+#   P.O.  → pending purchase order (SUPERVISOR entries, NOT real txns)
+#   REPL  → replacement
+# Quantities can be negative (cancellations) so we allow optional leading minus.
 _QTY_TYPE_PATTERN = re.compile(
-    r"^([\d+]+)\s+(SALE|PURC|RETURN|SALERET)$", re.IGNORECASE
+    r"^(-?[\d+]+)\s+(SALE|PURC|ST\.L|ST\.I|SRET|PRET|S/R|P/R|P\.O\.|RETURN|SALERET|REPL)$",
+    re.IGNORECASE,
 )
 
 # MRP + Company jammed in col 4: "91.00 SI SURGICA" / " 0.00 MERIL DIAG"
@@ -262,27 +275,85 @@ class DaybookParser(BaseParser):
 
     def _is_bill_header(self, row: list) -> bool:
         """
-        Bill header: col1 starts with DD-MM-YYYY, cols 3+4 empty.
-        Exception: when party name overflow into col2 makes city
-        detectable in col2.
+        Bill header: col1 starts with DD-MM-YYYY AND col2 is NOT a qty/type.
+
+        We previously required cols 3+4 empty, but real Marg exports have
+        4-column headers where party name overflows into col 2 and city
+        is in col 3 (e.g. "MAA MEDICAL AND,SURGICAL HOUSE,GAYA,,").
+
+        Using "col 2 isn't a qty/type" as the discriminator is more robust
+        because every item row MUST have a valid qty+type in col 2.
         """
         col1 = row[0].strip()
         if not re.match(r"^\d{2}-\d{2}-\d{4}", col1):
             return False
+        col2 = row[1].strip() if len(row) > 1 else ""
+        # If col2 looks like "50 SALE" or "10 P.O." etc, this is an item row
+        # that happens to start with a date — shouldn't occur, but defensive
+        if _QTY_TYPE_PATTERN.match(col2):
+            return False
+        return True
+
+    def _parse_bill_header_multi_col(self, row: list) -> dict:
+        """
+        Extract bill header when party name + city may span columns 2 and 3.
+        Used when col 3 is non-empty (4-column header format).
+
+        Example: "16-04-2026 A000114  MAA MEDICAL AND" | "SURGICAL HOUSEP.S-DELHA" | "GAYA"
+        → party = "MAA MEDICAL AND SURGICAL HOUSE P.S-DELHA", city = "GAYA"
+        """
+        col1 = row[0].strip()
+        col2 = row[1].strip() if len(row) > 1 else ""
         col3 = row[2].strip() if len(row) > 2 else ""
-        col4 = row[3].strip() if len(row) > 3 else ""
-        # Pure header: cols 3 & 4 empty
-        return not col3 and not col4
+
+        # Date
+        date_str = col1[:10]
+        try:
+            date_formatted = datetime.strptime(date_str, "%d-%m-%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            date_formatted = date_str
+
+        remainder = col1[10:].strip()
+
+        # Bill number
+        bill_match = _BILL_NO_PATTERN.match(remainder)
+        if bill_match:
+            bill_no = bill_match.group(1)
+            party_part1 = remainder[len(bill_no):].strip()
+        else:
+            parts = remainder.split(None, 1)
+            bill_no = parts[0] if parts else ""
+            party_part1 = parts[1].strip() if len(parts) > 1 else ""
+
+        # Stitch col 1 remainder + col 2 to form full party name
+        party_name = f"{party_part1} {col2}".strip()
+        city = col3.upper() if col3.upper() in {c.upper() for c in self._cities} else col3
+
+        return {
+            "date": date_formatted,
+            "bill_no": bill_no,
+            "party_name": party_name,
+            "city": city,
+        }
 
     def _parse_bill_header(self, row: list) -> dict:
         """
         Extract: date, bill_no, party_name, city.
 
-        Handles three real-world formats:
+        Handles four real-world formats:
           A. "10-04-2026 A000073     DR PIYUSH RANJAN", "         SASARAM"
           B. "11-04-2026 NASA26270007NATIONAL DRUG",    "AGENCIES        PATNA"
           C. "11-04-2026 A000078     ARSH MEDI TECH PRIVATE LIMITEDGAYA"
+          D. "16-04-2026 A000114 MAA MEDICAL AND", "SURGICAL HOUSEP.S-DELHA", "GAYA"
+             ↑ col 3 has city; party name spans col 1 + col 2
         """
+        col3 = row[2].strip() if len(row) > 2 else ""
+
+        # Format D: 4-column header with city in col 3
+        if col3:
+            return self._parse_bill_header_multi_col(row)
+
+        # Formats A, B, C: city in col 2 or concatenated in col 1
         col1 = row[0].strip()
         col2 = row[1].strip() if len(row) > 1 else ""
 
@@ -360,9 +431,12 @@ class DaybookParser(BaseParser):
         qty_raw = qty_match.group(1)
         txn_type = qty_match.group(2).upper()
 
-        # "50+10" → qty=50 (the free 10 is implicit; could be stored
-        # separately later if needed for scheme tracking)
-        qty = int(qty_raw.split("+")[0])
+        # Handle scheme "50+10" → qty=50 (10 free is implicit)
+        # Also handle negative qty (P.O. cancellations like "-10 P.O.")
+        if qty_raw.startswith("-"):
+            qty = -int(qty_raw[1:].split("+")[0])
+        else:
+            qty = int(qty_raw.split("+")[0])
 
         # Item code + item name + optional unit pack
         col1_parts = col1.split(None, 1)

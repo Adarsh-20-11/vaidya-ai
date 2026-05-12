@@ -49,9 +49,9 @@ class TestDaybookParserHappyPath(unittest.TestCase):
         self.assertIsInstance(self.result.data, pd.DataFrame)
 
     def test_correct_row_count(self):
-        # Fixture has 11 item lines across all bills + page break sections
-        self.assertEqual(self.result.row_count, 11,
-                         f"Expected 11 rows, got {self.result.row_count}")
+        # Fixture has 13 item lines: 11 SALE/PURC + 2 ST.L (stock loan)
+        self.assertEqual(self.result.row_count, 13,
+                         f"Expected 13 rows, got {self.result.row_count}")
 
     def test_required_columns_present(self):
         required = ["date", "bill_no", "party_name", "transaction_type",
@@ -114,6 +114,20 @@ class TestDaybookParserTransactions(unittest.TestCase):
         types = set(self.df["transaction_type"].unique())
         self.assertIn("SALE", types)
         self.assertIn("PURC", types)
+
+    def test_stock_loan_recognised(self):
+        """ST.L (Stock Loan to fellow stores at wholesale rate) must parse."""
+        types = set(self.df["transaction_type"].unique())
+        self.assertIn("ST.L", types,
+                      "ST.L transaction type was dropped — these are real outward "
+                      "stock movements and must be captured")
+
+    def test_stock_loan_bill_format(self):
+        """L-prefix bills (L000030) should parse despite having no city in col2."""
+        loan_rows = self.df[self.df["bill_no"].astype(str).str.startswith("L")]
+        self.assertFalse(loan_rows.empty, "Stock loan bills should be parsed")
+        self.assertIn("DR MUKTA MANI",
+                      loan_rows["party_name"].unique())
 
     def test_scheme_quantity_parsed(self):
         """50+10 SALE should yield qty=50 (10 is implicit free)."""

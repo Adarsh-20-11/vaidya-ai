@@ -24,6 +24,97 @@ from pipeline.transformers.daybook_transformer import DaybookTransformer
 FIXTURE_PATH = make_daybook_fixture()
 
 
+class TestDaybookTransformerDiscount(unittest.TestCase):
+    """Verify discount_pct is computed correctly from qty × rate vs amount."""
+
+    def _make_df(self, rows):
+        """Build a minimal parsed-daybook DataFrame for transformer tests."""
+        defaults = {
+            "date": "2026-04-15", "bill_no": "B1", "party_name": "TEST",
+            "city": "GAYA", "transaction_type": "SALE", "item_code": "X",
+            "item_name": "Item", "unit_pack": "", "mrp": 100.0,
+            "company": "Co", "batch_no": "B", "expiry": "Dec 2027",
+        }
+        return pd.DataFrame([{**defaults, **r} for r in rows])
+
+    def test_zero_discount_when_amount_equals_qty_times_rate(self):
+        df = self._make_df([
+            {"item_code": "A1", "bill_no": "B1", "qty": 10, "rate": 5.0, "amount": 50.0},
+        ])
+        split = DaybookTransformer().transform(df)
+        self.assertEqual(split.sales_entries["discount_pct"].iloc[0], 0.0)
+
+    def test_seven_point_five_pct_trade_discount(self):
+        """The MEDVEY BIO pattern from real data: 50 × 140 = 7000 but amount = 6510."""
+        df = self._make_df([
+            {"item_code": "A2", "bill_no": "B2", "qty": 50, "rate": 140.0, "amount": 6510.0},
+        ])
+        split = DaybookTransformer().transform(df)
+        # (7000 - 6510) / 7000 * 100 = 7.0
+        self.assertAlmostEqual(split.sales_entries["discount_pct"].iloc[0], 7.0, places=1)
+
+    def test_negative_discount_for_surcharge(self):
+        """Customer paid more than rate × qty (rare — rounding/manual adjustment)."""
+        df = self._make_df([
+            {"item_code": "A3", "bill_no": "B3", "qty": 10, "rate": 5.0, "amount": 55.0},
+        ])
+        split = DaybookTransformer().transform(df)
+        self.assertLess(split.sales_entries["discount_pct"].iloc[0], 0)
+
+    def test_nan_when_rate_is_zero(self):
+        """Divide-by-zero must produce NaN, not crash."""
+        df = self._make_df([
+            {"item_code": "A4", "bill_no": "B4", "qty": 1, "rate": 0.0, "amount": 100.0},
+        ])
+        split = DaybookTransformer().transform(df)
+        self.assertTrue(pd.isna(split.sales_entries["discount_pct"].iloc[0]))
+
+    def test_discount_present_on_purchase_entries(self):
+        df = self._make_df([
+            {"item_code": "A5", "bill_no": "B5",
+             "transaction_type": "PURC", "qty": 100, "rate": 10.0, "amount": 950.0},
+        ])
+        split = DaybookTransformer().transform(df)
+        self.assertEqual(split.purchase_entries["discount_pct"].iloc[0], 5.0)
+
+
+class TestDaybookTransformerCategories(unittest.TestCase):
+    """Verify transactions are tagged with the correct category."""
+
+    def setUp(self):
+        parser = DaybookParser()
+        result = parser.parse(FIXTURE_PATH, date(2026, 5, 10))
+        self.transformer = DaybookTransformer()
+        self.split = self.transformer.transform(result.data)
+
+    def test_sales_have_category_column(self):
+        self.assertIn("category", self.split.sales_entries.columns)
+
+    def test_purchases_have_category_column(self):
+        self.assertIn("category", self.split.purchase_entries.columns)
+
+    def test_retail_sales_categorised(self):
+        retail = self.split.sales_entries[
+            self.split.sales_entries["category"] == "retail"
+        ]
+        self.assertFalse(retail.empty, "Expected retail sales in fixture")
+
+    def test_wholesale_stock_loans_categorised(self):
+        """ST.L transactions should land in sales_entries with category='wholesale'."""
+        wholesale = self.split.sales_entries[
+            self.split.sales_entries["category"] == "wholesale"
+        ]
+        self.assertFalse(wholesale.empty,
+                         "ST.L stock loans should be tagged as 'wholesale'")
+
+    def test_no_wholesale_in_purchases(self):
+        """Wholesale outward shouldn't pollute purchase_entries."""
+        if not self.split.purchase_entries.empty:
+            cats = set(self.split.purchase_entries["category"].unique())
+            self.assertNotIn("wholesale", cats)
+            self.assertNotIn("retail", cats)
+
+
 class TestDaybookTransformerSplit(unittest.TestCase):
 
     def setUp(self):
@@ -62,13 +153,13 @@ class TestDaybookTransformerSplit(unittest.TestCase):
                           f"Missing column in purchase_entries: {col}")
 
     def test_no_sale_in_purchase_table(self):
-        """purchase_entries should contain only PURC rows."""
-        # Both tables are split by transaction_type, so we just verify the
-        # split happened correctly by checking the parsed counts
-        parsed_sales = (self.parsed["transaction_type"] == "SALE").sum()
-        parsed_purc = (self.parsed["transaction_type"] == "PURC").sum()
-        self.assertEqual(len(self.split.sales_entries), parsed_sales)
-        self.assertEqual(len(self.split.purchase_entries), parsed_purc)
+        """All outward txns go to sales_entries, all inward to purchase_entries."""
+        # Sum of both tables should equal total parsed records
+        # (every transaction is either outward or inward — none dropped)
+        parsed_count = len(self.parsed)
+        split_count = len(self.split.sales_entries) + len(self.split.purchase_entries)
+        self.assertEqual(split_count, parsed_count,
+                         "All parsed rows should land in exactly one table")
 
 
 class TestDaybookTransformerNewItems(unittest.TestCase):

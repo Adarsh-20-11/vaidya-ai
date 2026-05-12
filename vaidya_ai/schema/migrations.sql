@@ -117,12 +117,18 @@ CREATE TABLE IF NOT EXISTS purchase_entries (
     item_name           TEXT NOT NULL,
     qty                 NUMERIC(12, 2) NOT NULL,
     rate                NUMERIC(12, 2) NOT NULL,    -- Per unit purchase rate
-    amount              NUMERIC(14, 2),             -- qty × rate
+    amount              NUMERIC(14, 2),             -- actual billed amount
+    discount_pct        NUMERIC(6, 2),              -- ((qty*rate - amount) / (qty*rate)) × 100
+    category            TEXT DEFAULT 'purchase',    -- purchase | stock_in | purchase_return
+    batch_no            TEXT DEFAULT '',            -- '' (not NULL) so unique key works
+    expiry              TEXT,
     gst_pct             NUMERIC(6, 2),
     gst_amount          NUMERIC(14, 2),
     total               NUMERIC(14, 2),             -- amount + gst_amount
     created_at          TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (invoice_no, item_code, date)
+    -- One invoice can have the same item across multiple batches.
+    -- batch_no is part of the key (with '' fallback) so each line is unique.
+    UNIQUE (invoice_no, item_code, date, batch_no)
 );
 
 CREATE INDEX IF NOT EXISTS idx_purchase_vendor_date
@@ -131,8 +137,12 @@ CREATE INDEX IF NOT EXISTS idx_purchase_vendor_date
 CREATE INDEX IF NOT EXISTS idx_purchase_item
     ON purchase_entries (item_code, date DESC);
 
+CREATE INDEX IF NOT EXISTS idx_purchase_category
+    ON purchase_entries (category, date DESC);
+
 
 -- Sales register: all items sold to customers
+-- Includes retail SALE, wholesale stock loans (ST.L), and returns
 CREATE TABLE IF NOT EXISTS sales_entries (
     id                  BIGSERIAL PRIMARY KEY,
     date                DATE NOT NULL,
@@ -143,12 +153,18 @@ CREATE TABLE IF NOT EXISTS sales_entries (
     qty                 NUMERIC(12, 2) NOT NULL,
     rate                NUMERIC(12, 2) NOT NULL,
     mrp                 NUMERIC(12, 2),
-    amount              NUMERIC(14, 2),
+    amount              NUMERIC(14, 2),             -- actual billed amount
+    discount_pct        NUMERIC(6, 2),              -- ((qty*rate - amount) / (qty*rate)) × 100
+    category            TEXT DEFAULT 'retail',      -- retail | wholesale | sales_return | replacement
+    batch_no            TEXT DEFAULT '',            -- '' (not NULL) so unique key works
+    expiry              TEXT,
     gst_pct             NUMERIC(6, 2),
     gst_amount          NUMERIC(14, 2),
     total               NUMERIC(14, 2),
     created_at          TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (invoice_no, item_code, date)
+    -- One invoice can have the same item across multiple batches.
+    -- batch_no is part of the key (with '' fallback) so each line is unique.
+    UNIQUE (invoice_no, item_code, date, batch_no)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sales_customer_date
@@ -156,6 +172,41 @@ CREATE INDEX IF NOT EXISTS idx_sales_customer_date
 
 CREATE INDEX IF NOT EXISTS idx_sales_item
     ON sales_entries (item_code, date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sales_category
+    ON sales_entries (category, date DESC);
+
+
+-- ─────────────────────────────────────────────────────────────────────
+-- MIGRATIONS FOR EXISTING INSTALLATIONS
+-- ─────────────────────────────────────────────────────────────────────
+-- If you already created sales_entries / purchase_entries WITHOUT the newer
+-- columns, run these to add them:
+--
+--   ALTER TABLE sales_entries     ADD COLUMN IF NOT EXISTS category     TEXT DEFAULT 'retail';
+--   ALTER TABLE purchase_entries  ADD COLUMN IF NOT EXISTS category     TEXT DEFAULT 'purchase';
+--   ALTER TABLE sales_entries     ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(6, 2);
+--   ALTER TABLE purchase_entries  ADD COLUMN IF NOT EXISTS discount_pct NUMERIC(6, 2);
+--
+-- The batch_no migration is more involved because the unique constraint changes.
+-- Run these together if you've already created the tables:
+--
+--   ALTER TABLE sales_entries     ADD COLUMN IF NOT EXISTS batch_no TEXT DEFAULT '';
+--   ALTER TABLE purchase_entries  ADD COLUMN IF NOT EXISTS batch_no TEXT DEFAULT '';
+--   ALTER TABLE sales_entries     ADD COLUMN IF NOT EXISTS expiry   TEXT;
+--   ALTER TABLE purchase_entries  ADD COLUMN IF NOT EXISTS expiry   TEXT;
+--
+--   -- Backfill empty string for any NULL batch_no rows already loaded
+--   UPDATE sales_entries     SET batch_no = '' WHERE batch_no IS NULL;
+--   UPDATE purchase_entries  SET batch_no = '' WHERE batch_no IS NULL;
+--
+--   -- Drop the old unique constraint and add the new one
+--   ALTER TABLE sales_entries     DROP CONSTRAINT IF EXISTS sales_entries_invoice_no_item_code_date_key;
+--   ALTER TABLE purchase_entries  DROP CONSTRAINT IF EXISTS purchase_entries_invoice_no_item_code_date_key;
+--   ALTER TABLE sales_entries     ADD CONSTRAINT sales_entries_unique
+--     UNIQUE (invoice_no, item_code, date, batch_no);
+--   ALTER TABLE purchase_entries  ADD CONSTRAINT purchase_entries_unique
+--     UNIQUE (invoice_no, item_code, date, batch_no);
 
 
 -- =============================================================================

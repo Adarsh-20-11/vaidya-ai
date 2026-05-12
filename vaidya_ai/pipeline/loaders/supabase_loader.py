@@ -12,8 +12,9 @@ Design principles:
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 
 import pandas as pd
@@ -23,6 +24,65 @@ from config.settings import supabase_config
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 500  # Supabase free tier is comfortable with 500 rows per request
+
+
+def _clean_record(record: dict) -> dict:
+    """
+    Sanitise a single record before sending to Supabase JSON API.
+
+    Handles:
+      - NaN / Inf floats → None (JSON doesn't allow these)
+      - pandas.NA / NaT  → None
+      - numpy scalar types → native Python types
+      - pd.Timestamp / pd.Datetime → ISO date string
+
+    Without this, Supabase rejects the batch with:
+      "Out of range float values are not JSON compliant: nan"
+    """
+    cleaned = {}
+    for key, value in record.items():
+        # pd.NA is its own singleton — check first
+        if value is pd.NA:
+            cleaned[key] = None
+            continue
+
+        # NaT (missing datetime)
+        if value is pd.NaT:
+            cleaned[key] = None
+            continue
+
+        # NaN / Inf floats
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                cleaned[key] = None
+            else:
+                cleaned[key] = value
+            continue
+
+        # pandas Timestamp / datetime → ISO string
+        if isinstance(value, (pd.Timestamp, datetime, date)):
+            try:
+                # date() handles both Timestamp and datetime
+                cleaned[key] = value.isoformat() if hasattr(value, "isoformat") else str(value)
+            except Exception:
+                cleaned[key] = str(value)
+            continue
+
+        # numpy scalars (int64, float64, bool_) — convert to native via .item()
+        if hasattr(value, "item") and hasattr(value, "dtype"):
+            try:
+                native = value.item()
+                # Re-check for NaN in case .item() returned float NaN
+                if isinstance(native, float) and (math.isnan(native) or math.isinf(native)):
+                    cleaned[key] = None
+                else:
+                    cleaned[key] = native
+            except Exception:
+                cleaned[key] = value
+            continue
+
+        cleaned[key] = value
+    return cleaned
 
 
 @dataclass
@@ -81,11 +141,13 @@ class SupabaseLoader:
             meta_cols = [c for c in df.columns if c.startswith("_")]
             df = df.drop(columns=meta_cols, errors="ignore")
 
-        # Replace NaN with None (Supabase expects null, not NaN)
-        df = df.where(pd.notna(df), None)
-
-        # Convert to records
+        # Convert to records, then sanitise.
+        # pandas' .where(mask, None) doesn't reliably convert NaN to None in
+        # numeric columns — they often come back as NaN after to_dict().
+        # We sanitise the dicts directly which is bulletproof.
         records = df.to_dict(orient="records")
+        records = [_clean_record(r) for r in records]
+
         total = len(records)
         upserted = 0
         errors = []

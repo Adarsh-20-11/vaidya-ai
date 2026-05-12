@@ -226,7 +226,7 @@ def run_daybook(file_path: str, dry_run: bool, report_date: Optional[date]) -> b
     if not split.sales_entries.empty:
         r = loader.upsert(
             "sales_entries", split.sales_entries,
-            ["invoice_no", "item_code", "date"]
+            ["invoice_no", "item_code", "date","batch_no"]
         )
         logger.info(f"  sales_entries: {r.rows_upserted} upserted")
 
@@ -234,7 +234,7 @@ def run_daybook(file_path: str, dry_run: bool, report_date: Optional[date]) -> b
     if not split.purchase_entries.empty:
         r = loader.upsert(
             "purchase_entries", split.purchase_entries,
-            ["invoice_no", "item_code", "date"]
+            ["invoice_no", "item_code", "date", "batch_no"]
         )
         logger.info(f"  purchase_entries: {r.rows_upserted} upserted")
 
@@ -310,7 +310,7 @@ def main():
     export_dir = Path(pipeline_config.export_dir)
     success = True
 
-    def find_file(prefix: str, extensions: tuple = (".xlsx",)) -> Optional[str]:
+    def find_file(prefix: str, extensions: tuple = (".xlsx",".xls",".csv")) -> Optional[str]:
         """Find a matching file in export_dir. Defaults to .xlsx; daybook uses .csv."""
         if args.file:
             return args.file
