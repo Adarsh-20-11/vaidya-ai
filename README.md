@@ -130,7 +130,7 @@ npm install
 cp .env.example .env.local  # Fill in credentials including MCP_SERVER_PATH
 npm run dev
 ```
-
+#Still under development, hence localhost link for now. Placeholder.
 Open http://localhost:3000
 
 ### 5. (Optional) Connect Claude Desktop
