@@ -86,7 +86,7 @@ class BaseParser(ABC):
 
         # ── File checks ──
         # Check extension first — catches obvious type errors even for missing files
-        if path.suffix.lower() not in (".xlsx", ".xls", ".xlsm", ".csv"):
+        if path.suffix.lower() not in (".xlsx", ".xls", ".csv"):
             return ParseResult(
                 success=False, report_id=self.schema.report_id,
                 file_path=file_path, report_date=report_date,
@@ -169,35 +169,16 @@ class BaseParser(ABC):
     def _load_raw(self, path: Path) -> pd.DataFrame:
         """Load Excel or CSV into a raw DataFrame. Picks engine by extension."""
         suffix = path.suffix.lower()
-
         if suffix == ".csv":
             return pd.read_csv(path, skiprows=self.schema.skip_rows, dtype=str)
-
-        # Pick the right Excel engine
-        if suffix == ".xls":
-            engine = "xlrd"       # old binary BIFF format (needs xlrd==2.0.1)
-        else:
-            engine = "openpyxl"   # modern .xlsx/.xlsm
-
-        try:
-            return pd.read_excel(
-                path,
-                sheet_name=self.schema.sheet_name or 0,
-                skiprows=self.schema.skip_rows,
-                dtype=str,
-                engine=engine,
-            )
-        except Exception as e:
-            # Fallback: some Marg exports are HTML disguised as .xls
-            # pd.read_html returns a list of DataFrames — take the first
-            if "xlrd" in str(e).lower() or "not a zip" in str(e).lower() or "unsupported" in str(e).lower():
-                try:
-                    tables = pd.read_html(path)
-                    if tables:
-                        return tables[0]
-                except Exception:
-                    pass
-            raise
+        engine = "xlrd" if suffix == ".xls" else "openpyxl"
+        return pd.read_excel(
+            path,
+            sheet_name=self.schema.sheet_name or 0,
+            skiprows=self.schema.skip_rows,
+            dtype=str,
+            engine=engine,
+        )
 
     def _resolve_columns(self, df: pd.DataFrame):
         """

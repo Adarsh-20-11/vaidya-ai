@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__vaidya-ai__anomalies",
+      "mcp__vaidya-ai__stock_status",
+      "mcp__vaidya-ai__margin_alerts",
+      "mcp__vaidya-ai__below_cost_sales",
+      "mcp__vaidya-ai__item_rate_variance",
+      "mcp__vaidya-ai__customer_discounts"
+    ]
+  }
+}

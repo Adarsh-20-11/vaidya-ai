@@ -40,6 +40,7 @@ Thumbs.db
 # Project-specific
 exports/
 output/
+archived/
 *.log
 tests/fixtures/*.xlsx
 !tests/fixtures/generate_fixtures.py

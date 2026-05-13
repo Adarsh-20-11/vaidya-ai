@@ -143,6 +143,8 @@ class DaybookTransformer:
         # Avoid divide-by-zero: replace 0 with NaN, ratio becomes NaN
         safe_expected = expected.where(expected != 0)
         discount_pct = ((expected - df["amount"]) / safe_expected * 100).round(2)
+        # Cap extreme values — rate=0 or data anomalies can produce huge numbers
+        discount_pct = discount_pct.clip(-9999, 9999)
         return discount_pct
 
     def _build_sales_entries(self, df: pd.DataFrame) -> pd.DataFrame:

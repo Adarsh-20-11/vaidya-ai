@@ -230,6 +230,24 @@ REPORT_SCHEMAS: Dict[str, ReportSchema] = {
     "purchase_register":  PURCHASE_REGISTER_SCHEMA,
     "sales_register":     SALES_REGISTER_SCHEMA,
     "item_daybook":       ITEM_DAYBOOK_SCHEMA,
+    "outstanding_ledger": ReportSchema(
+        report_id="outstanding_ledger",
+        display_name="Outstanding Ledger",
+        description="Party-wise outstanding balances. One row per party. "
+                    "Source: Marg Silver → Accounts → Outstanding Report.",
+        columns=[
+            ColumnSpec("serial",      "str",   required=False),
+            ColumnSpec("party_name",  "str",   required=True,
+                       aliases=["ledger", "name", "party"]),
+            ColumnSpec("group",       "str",   required=True),
+            ColumnSpec("debit",       "float", required=False),
+            ColumnSpec("credit",      "float", required=False),
+        ],
+        skip_rows=0,
+        notes="Party name and city are in the same column, space-padded. "
+              "Parser splits them using known city list. "
+              "Filter: keep only SUNDRY DEBTORS and SUNDRY CREDITORS groups."
+    ),
 }
 
 

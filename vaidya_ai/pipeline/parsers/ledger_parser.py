@@ -1,130 +1,180 @@
 """
 pipeline/parsers/ledger_parser.py
 
-Parser for Marg Silver → Accounts → Party Ledger (Excel export).
+Parser for Marg Silver's Outstanding Ledger report.
+Point-in-time snapshot: one row per party, current balance only.
 
-WHAT IT DOES:
-  - Extracts party name from the report header (not a data column)
-  - Parses transaction rows: date, voucher type, debit, credit, balance
-  - Infers balance direction (Dr = party owes Magadh, Cr = Magadh owes party)
-  - Flags overdue invoices based on date
-  - Handles multi-party ledger exports (one party per section)
+Input: XLS (5 columns)
+  serial | party_name+city (space-padded) | group | debit | credit
 
-NOTE:
-  Ledger exports are structurally different from stock exports.
-  The party name appears as a header row, not a column.
-  The parser must detect these header rows and assign party names accordingly.
-  Until we see a real ledger export, _post_process does best-effort extraction.
+Output columns:
+  party_name, city, group, party_type, debit, credit, net_outstanding
+
+party_type:
+  'customer' — SUNDRY DEBTORS (they owe us)
+  'vendor'   — SUNDRY CREDITORS (we owe them)
 """
 
-import re
-from datetime import date, datetime, timedelta
-from typing import Optional, List, Tuple
+import logging
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Optional, List
 
 import pandas as pd
 
 from config.report_schemas import get_schema
-from pipeline.parsers.base_parser import BaseParser
+from config.settings import business_rules
+from pipeline.parsers.base_parser import ParseResult
+
+logger = logging.getLogger(__name__)
+
+RELEVANT_GROUPS = {
+    "SUNDRY DEBTORS",
+    "SUNDRY CREDITORS (SUPPLIERS)",
+    "SUNDRY CREDITORS (MANUFACTURERS)",
+}
+
+GROUP_TO_TYPE = {
+    "SUNDRY DEBTORS":                   "customer",
+    "SUNDRY CREDITORS (SUPPLIERS)":     "vendor",
+    "SUNDRY CREDITORS (MANUFACTURERS)": "vendor",
+}
 
 
-# Typical credit terms in pharma distribution (days)
-DEFAULT_CREDIT_DAYS = 30
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 
-class LedgerParser(BaseParser):
+def _split_party_city(raw: str, known_cities: list) -> tuple:
+    """Split "PARTY NAME          CITY" into ("PARTY NAME", "CITY")."""
+    raw = (raw or "").strip()
+    for city in sorted(known_cities, key=len, reverse=True):
+        if raw.upper().endswith(city.upper()):
+            party = raw[:len(raw) - len(city)].strip()
+            return party, city.upper()
+    return raw, ""
 
-    def __init__(self, credit_days: int = DEFAULT_CREDIT_DAYS):
-        super().__init__(schema=get_schema("ledger"))
-        self.credit_days = credit_days
 
-    def _post_process(
-        self,
-        df: pd.DataFrame,
-        report_date: Optional[date]
-    ) -> Tuple[pd.DataFrame, List[str], List[str]]:
-        errors = []
-        warnings = []
+class LedgerParser:
+    """Parser for Marg Outstanding Ledger XLS export."""
 
-        # ── Extract party name from header rows if not a column ──
-        if "party_name" not in df.columns or df["party_name"].isna().all():
-            df, party_warnings = self._extract_party_from_headers(df)
-            warnings.extend(party_warnings)
+    def __init__(self):
+        self.schema = get_schema("outstanding_ledger")
 
-        # ── Compute net balance direction ──
-        if "debit" in df.columns and "credit" in df.columns:
-            df["net_amount"] = df["debit"].fillna(0) - df["credit"].fillna(0)
+    def parse(self, file_path: str, report_date: Optional[date] = None) -> ParseResult:
+        path = Path(file_path)
+        errors: List[str] = []
+        warnings: List[str] = []
 
-        # ── Flag overdue based on invoice date and credit terms ──
-        if "date" in df.columns and report_date:
-            cutoff = report_date - timedelta(days=self.credit_days)
-            df["is_overdue"] = (
-                (df["date"].dt.date < cutoff) &
-                (df["net_amount"].fillna(0) > 0)  # debit balance = amount owed
-            )
-            overdue_count = df["is_overdue"].sum()
-            if overdue_count > 0:
-                warnings.append(
-                    f"{overdue_count} transactions appear overdue "
-                    f"(>{self.credit_days} days old with outstanding debit)"
-                )
-
-        # ── Compute days outstanding per transaction ──
-        if "date" in df.columns and report_date:
-            df["days_outstanding"] = (
-                pd.Timestamp(report_date) - df["date"]
-            ).dt.days.clip(lower=0)
-
-        # ── Infer balance type (Dr/Cr) from balance column if present ──
-        if "balance" in df.columns:
-            # Marg sometimes appends 'Dr' or 'Cr' to balance values
-            df["balance_type"] = df["balance"].astype(str).str.extract(
-                r"(Dr|Cr|DR|CR)", expand=False
-            ).str.upper()
-            df["balance"] = pd.to_numeric(
-                df["balance"].astype(str)
-                .str.replace(r"[DrCR\s]", "", regex=True)
-                .str.replace(",", ""),
-                errors="coerce"
+        if not path.exists():
+            return ParseResult(
+                success=False, report_id=self.schema.report_id,
+                file_path=file_path, report_date=report_date,
+                data=None, errors=[f"File not found: {file_path}"]
             )
 
-        return df, errors, warnings
-
-    def _extract_party_from_headers(
-        self, df: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, List[str]]:
-        """
-        Marg ledger exports often have party name as a non-data row.
-        This method attempts to detect and propagate party names.
-        Returns updated df and list of warnings.
-        """
-        warnings = []
-        current_party = None
-        party_col = []
-
-        # Heuristic: a "header" row has mostly NaN numeric columns
-        # and a non-null string in the first column that looks like a name
-        numeric_cols = df.select_dtypes(include="number").columns.tolist()
-
-        for idx, row in df.iterrows():
-            numeric_nulls = sum(1 for c in numeric_cols if pd.isna(row.get(c)))
-            is_likely_header = (
-                len(numeric_cols) > 0 and
-                numeric_nulls == len(numeric_cols) and
-                pd.notna(row.iloc[0]) and
-                len(str(row.iloc[0]).strip()) > 3
+        suffix = path.suffix.lower()
+        if suffix not in (".xls", ".xlsx", ".csv"):
+            return ParseResult(
+                success=False, report_id=self.schema.report_id,
+                file_path=file_path, report_date=report_date,
+                data=None, errors=[f"Unsupported format: {suffix}"]
             )
 
-            if is_likely_header:
-                current_party = str(row.iloc[0]).strip()
+        # ── Load ──
+        try:
+            if suffix == ".csv":
+                raw = pd.read_csv(file_path, dtype=str, header=0)
+            else:
+                engine = "xlrd" if suffix == ".xls" else "openpyxl"
+                raw = pd.read_excel(file_path, dtype=str, engine=engine, header=0)
+        except Exception as e:
+            return ParseResult(
+                success=False, report_id=self.schema.report_id,
+                file_path=file_path, report_date=report_date,
+                data=None, errors=[f"Failed to load file: {e}"]
+            )
 
-            party_col.append(current_party)
+        logger.info(f"Ledger raw: {len(raw)} rows, cols: {list(raw.columns)}")
 
-        df["party_name"] = party_col
+        if len(raw.columns) < 5:
+            return ParseResult(
+                success=False, report_id=self.schema.report_id,
+                file_path=file_path, report_date=report_date,
+                data=None,
+                errors=[f"Expected 5 columns, got {len(raw.columns)}"]
+            )
 
-        if current_party is None:
+        raw.columns = ["serial", "party_raw", "group", "debit_raw", "credit_raw"]
+        raw["group"] = raw["group"].astype(str).str.strip().str.upper()
+
+        # ── Filter to relevant groups only ──
+        relevant = raw[raw["group"].isin(
+            {g.upper() for g in RELEVANT_GROUPS}
+        )].copy()
+
+        if relevant.empty:
             warnings.append(
-                "Could not extract party name from ledger headers. "
-                "party_name will be null. Check the raw export format."
+                "No SUNDRY DEBTORS or SUNDRY CREDITORS rows found — "
+                "check column order or group names in the export."
             )
 
-        return df, warnings
+        # ── Split party name + city ──
+        known_cities = [c.upper() for c in business_rules.known_cities]
+        splits = relevant["party_raw"].apply(
+            lambda r: pd.Series(
+                _split_party_city(str(r), known_cities),
+                index=["party_name", "city"]
+            )
+        )
+        relevant = pd.concat([relevant, splits], axis=1)
+
+        # ── Numeric columns ──
+        def to_float(s):
+            try:
+                v = float(str(s).replace(",", "").strip())
+                return v if v != 0 else None
+            except (ValueError, TypeError):
+                return None
+
+        relevant["debit"]  = relevant["debit_raw"].apply(to_float)
+        relevant["credit"] = relevant["credit_raw"].apply(to_float)
+        relevant["net_outstanding"] = (
+            relevant["debit"].fillna(0) - relevant["credit"].fillna(0)
+        )
+
+        # ── Party type ──
+        relevant["party_type"] = relevant["group"].map(
+            {k.upper(): v for k, v in GROUP_TO_TYPE.items()}
+        ).fillna("unknown")
+
+        # ── Output ──
+        out = relevant[
+            ["party_name", "city", "group", "party_type",
+             "debit", "credit", "net_outstanding"]
+        ].copy()
+        out = out[out["party_name"].str.strip() != ""]
+        out["_report_id"]   = self.schema.report_id
+        out["_report_date"] = (report_date or date.today()).isoformat()
+        out["_parsed_at"]   = _utcnow().isoformat()
+
+        # ── Summary warnings ──
+        customers = (out["party_type"] == "customer").sum()
+        vendors   = (out["party_type"] == "vendor").sum()
+        receivable = out.loc[out["party_type"] == "customer", "debit"].sum()
+        payable    = out.loc[out["party_type"] == "vendor", "credit"].sum()
+        warnings.append(
+            f"Parsed {customers} customers (receivable ₹{receivable:,.0f}) "
+            f"and {vendors} vendors (payable ₹{payable:,.0f})"
+        )
+
+        return ParseResult(
+            success=True,
+            report_id=self.schema.report_id,
+            file_path=file_path,
+            report_date=report_date,
+            data=out,
+            row_count=len(out),
+            errors=errors,
+            warnings=warnings,
+        )

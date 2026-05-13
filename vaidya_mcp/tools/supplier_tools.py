@@ -115,11 +115,14 @@ def get_supplier_info(
 
 def get_margin_alerts(threshold_pct: float = 8.0) -> dict:
     """
-    Get items where profit margin is critically low or eroding.
+    Get items where profit margin is critically low, eroding, or negative (loss).
+
+    Margin = (sale_rate - purchase_cost) / purchase_cost × 100
+    Negative margin = selling below what we paid for it.
 
     Use this tool when:
     - Owner asks about profitability
-    - You suspect a supplier has increased rates without MRP revision
+    - Supplier has increased rates without price revision
     - Generating weekly margin review
     - Looking for items that need price revision
 
@@ -127,61 +130,56 @@ def get_margin_alerts(threshold_pct: float = 8.0) -> dict:
         threshold_pct: Flag items with margin below this % (default 8%)
 
     Returns dict with:
-        critical:  Items below 3% margin (immediate action needed)
-        watch:     Items between 3-8% margin
-        context:   Explanation of why margins may have eroded
+        loss:     Items sold below purchase cost (negative margin)
+        critical: Items below 3% margin (immediate action needed)
+        watch:    Items between 3-8% margin
     """
     try:
         client = get_supabase()
 
-        result = client.table("anomalies_today")\
-            .select("*")\
-            .eq("anomaly_type", "margin_erosion")\
-            .eq("detected_date", date.today().isoformat())\
-            .execute()
-
-        anomalies = result.data or []
-
-        # Also pull directly from item_health for watch-level margins
-        health_result = client.table("item_health")\
-            .select("item_code, margin_pct, margin_status, computed_date")\
-            .eq("computed_date", date.today().isoformat())\
-            .in_("margin_status", ["critical", "watch"])\
+        # v_item_health_named has item_name from stock_items join
+        health_result = client.table("v_item_health_named")\
+            .select("item_code, item_name, supplier, margin_pct, margin_status")\
+            .in_("margin_status", ["loss", "critical", "watch"])\
             .order("margin_pct")\
             .execute()
 
         health_items = health_result.data or []
 
-        # Enrich with item names
-        enriched = []
-        for h in health_items:
-            code = h.get("item_code")
-            item = client.table("stock_items")\
-                .select("name, company, mrp")\
-                .eq("code", code)\
-                .execute()
-            if item.data:
-                h.update(item.data[0])
-            enriched.append(h)
+        loss     = [i for i in health_items if i.get("margin_status") == "loss"]
+        critical = [i for i in health_items if i.get("margin_status") == "critical"]
+        watch    = [i for i in health_items if i.get("margin_status") == "watch"]
 
-        critical = [i for i in enriched if i.get("margin_status") == "critical"]
-        watch = [i for i in enriched if i.get("margin_status") == "watch"]
+        rec = []
+        if loss:
+            rec.append(
+                f"{len(loss)} items are being sold BELOW purchase cost — "
+                "check if this is intentional (promotional pricing) or an error."
+            )
+        if critical:
+            rec.append(
+                f"{len(critical)} items have <3% margin — "
+                "negotiate purchase rate or revise sale price."
+            )
 
         return {
+            "loss": loss,
             "critical": critical,
             "watch": watch,
+            "loss_count": len(loss),
             "critical_count": len(critical),
             "watch_count": len(watch),
             "threshold_used": threshold_pct,
-            "recommendation": (
-                "For critical items: either negotiate purchase rate with supplier "
-                "or revise MRP upward. Margins below 3% are not sustainable."
-            ) if critical else "No critical margin items today."
+            "note": (
+                "Margin = (sale_rate - purchase_cost) / purchase_cost × 100. "
+                "MRP is not used in this calculation."
+            ),
+            "recommendation": " ".join(rec) if rec else "Margins look healthy today."
         }
 
     except Exception as e:
         logger.error(f"get_margin_alerts failed: {e}")
-        return {"error": str(e), "critical": [], "watch": []}
+        return {"error": str(e), "loss": [], "critical": [], "watch": []}
 
 
 def get_anomalies(
@@ -189,54 +187,57 @@ def get_anomalies(
     anomaly_type: Optional[str] = None
 ) -> dict:
     """
-    Get all flagged anomalies for today requiring attention.
+    Get all flagged anomalies requiring attention.
 
     Use this tool when:
     - Starting the morning brief
     - Owner asks 'kya problem hai aaj?'
-    - You want a comprehensive view of what needs attention
     - Checking if a specific type of issue exists
 
     Args:
         severity:     Filter by 'critical' | 'high' | 'medium' | 'low'
         anomaly_type: Filter by type:
                       'negative_stock'  — stock quantity is negative
-                      'critical_stock'  — running out in ≤14 days
-                      'margin_erosion'  — margin below threshold
+                      'critical_stock'  — running out based on velocity
+                      'margin_erosion'  — selling at a loss or near-loss
                       'dead_stock'      — no movement in 90 days
-                      'velocity_spike'  — sudden sales surge
-
-    Returns dict with all anomalies grouped by severity.
     """
     try:
         client = get_supabase()
 
-        q = client.table("anomalies_today")\
-            .select("*")\
-            .eq("detected_date", date.today().isoformat())\
-            .eq("resolved", False)
+        # v_anomalies has item_name from stock_items join — always correct
+        q = client.table("v_anomalies").select(
+            "item_code, item_name, supplier, anomaly_type, severity, "
+            "detail, detected_date, closing_stock, days_remaining, "
+            "margin_pct, predicted_stockout_date"
+        )
 
         if severity:
             q = q.eq("severity", severity)
         if anomaly_type:
             q = q.eq("anomaly_type", anomaly_type)
+        else:
+            # Dead stock is too noisy in the general view — use get_dead_stock() specifically
+            q = q.neq("anomaly_type", "dead_stock")
 
-        result = q.order("severity").execute()
+        result = q.order("severity").limit(100).execute()
         anomalies = result.data or []
 
         # Group by severity
-        grouped = {"critical": [], "high": [], "medium": [], "low": []}
+        grouped: dict = {"critical": [], "high": [], "medium": [], "low": []}
         for a in anomalies:
             sev = a.get("severity", "low")
             grouped.setdefault(sev, []).append(a)
 
-        total = len(anomalies)
         return {
             "anomalies": grouped,
-            "total": total,
+            "total": len(anomalies),
             "as_of": date.today().isoformat(),
             "summary": {k: len(v) for k, v in grouped.items()},
-            "note": "Use get_item_velocity() on critical items to understand impact"
+            "note": (
+                "dead_stock excluded here — use dead_stock() tool for those. "
+                "Use get_item_velocity() on critical items to understand impact."
+            )
         }
 
     except Exception as e:

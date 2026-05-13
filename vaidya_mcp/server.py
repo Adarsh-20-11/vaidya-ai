@@ -76,6 +76,11 @@ from tools.customer_tools import (
     compare_customer_rates,
     get_below_cost_sales,
 )
+from tools.ledger_tools import (
+    get_customer_outstanding,
+    get_vendor_payables,
+    get_party_balance,
+)
 from resources.brief_resource import (
     get_daily_brief_content,
     get_pipeline_status_content,
@@ -107,6 +112,11 @@ CUSTOMER TIER (use for pricing/customer-rate questions):
 11. compare_rates_across_customers() — Side-by-side pricing for one item
 12. below_cost_sales()             — Sales that lost money
 
+LEDGER / OUTSTANDING:
+13. customer_outstanding()  — Kaun paisa nahi diya (receivables)
+14. vendor_payables()       — Kisko paisa dena hai (payables)
+15. party_balance(name)     — Specific party balance lookup
+
 RESOURCES:
 - vaidya://brief/today     — Today's pre-generated brief
 - vaidya://pipeline/status — Data freshness and pipeline health
@@ -117,6 +127,8 @@ DECISION FLOW:
 - 'Who pays the most/least?'      → customer_discounts() or compare_rates_across_customers()
 - 'Are we losing money anywhere?' → below_cost_sales() + margin_alerts()
 - 'Are we pricing consistently?'  → item_rate_variance()
+- 'Kaun paisa nahi diya?'         → customer_outstanding()
+- 'Kisko paisa dena hai?'         → vendor_payables()
 
 Always check pipeline/status if data seems stale or incomplete.
 """.strip()
@@ -292,6 +304,42 @@ def below_cost_sales(limit: int = 20) -> dict:
     Returns transactions sorted by total loss value (worst first).
     """
     return get_below_cost_sales(limit=limit)
+
+
+# ────────────────────────────────────────────
+# LEDGER / OUTSTANDING TOOLS
+# ────────────────────────────────────────────
+
+@mcp.tool()
+def customer_outstanding(min_amount: float = 0, limit: int = 20) -> dict:
+    """
+    Get customers with outstanding receivables — money they owe us.
+    Sorted by amount highest first.
+    Use when owner asks 'kaun paisa nahi diya?' or before approving a 
+    large credit order to a customer.
+    """
+    return get_customer_outstanding(min_amount=min_amount, limit=limit)
+
+
+@mcp.tool()
+def vendor_payables(min_amount: float = 0, limit: int = 20) -> dict:
+    """
+    Get vendors we owe money to — our outstanding payables.
+    Use when owner asks 'kisko paisa dena hai?' or for payment planning.
+    Cross-reference with stock_status: if a vendor has critical stock
+    AND high payables, pay them first to maintain supply.
+    """
+    return get_vendor_payables(min_amount=min_amount, limit=limit)
+
+
+@mcp.tool()
+def party_balance(party_name: str) -> dict:
+    """
+    Get outstanding balance for a specific customer or vendor.
+    Use before approving a large credit order or checking payment status.
+    Accepts partial name — 'ARSH' will find 'ARSH MEDI TECH PRIVATE LIMITED'.
+    """
+    return get_party_balance(party_name=party_name)
 
 
 # ────────────────────────────────────────────

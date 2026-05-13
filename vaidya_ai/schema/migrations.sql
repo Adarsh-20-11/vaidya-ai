@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS stock_snapshots (
     sales_price         NUMERIC(12, 2),             -- Selling price per unit
     cost                NUMERIC(12, 2),             -- Cost value (may differ from purchase_price)
     value               NUMERIC(14, 2),             -- Total inventory value (stock × cost)
-    margin_pct          NUMERIC(6, 2),              -- (mrp - purchase_price) / mrp * 100
+    margin_pct          NUMERIC(10, 2),             -- (mrp - purchase_price) / mrp * 100
     is_negative_stock   BOOLEAN DEFAULT FALSE,      -- Flag: stock < 0
     supplier_unknown    BOOLEAN DEFAULT FALSE,      -- Flag: company was -BLANK-
     created_at          TIMESTAMPTZ DEFAULT NOW(),
@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS purchase_entries (
     qty                 NUMERIC(12, 2) NOT NULL,
     rate                NUMERIC(12, 2) NOT NULL,    -- Per unit purchase rate
     amount              NUMERIC(14, 2),             -- actual billed amount
-    discount_pct        NUMERIC(6, 2),              -- ((qty*rate - amount) / (qty*rate)) × 100
+    discount_pct        NUMERIC(10, 2),              -- ((qty*rate - amount) / (qty*rate)) × 100
     category            TEXT DEFAULT 'purchase',    -- purchase | stock_in | purchase_return
     batch_no            TEXT DEFAULT '',            -- '' (not NULL) so unique key works
     expiry              TEXT,
@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS sales_entries (
     rate                NUMERIC(12, 2) NOT NULL,
     mrp                 NUMERIC(12, 2),
     amount              NUMERIC(14, 2),             -- actual billed amount
-    discount_pct        NUMERIC(6, 2),              -- ((qty*rate - amount) / (qty*rate)) × 100
+    discount_pct        NUMERIC(10, 2),              -- ((qty*rate - amount) / (qty*rate)) × 100
     category            TEXT DEFAULT 'retail',      -- retail | wholesale | sales_return | replacement
     batch_no            TEXT DEFAULT '',            -- '' (not NULL) so unique key works
     expiry              TEXT,
@@ -241,7 +241,7 @@ CREATE TABLE IF NOT EXISTS item_health (
     closing_stock       NUMERIC(12, 2),
     days_remaining      NUMERIC(8, 1),              -- Stock / avg_daily_sales_30d. NULL if no velocity.
     reorder_urgency     TEXT NOT NULL,              -- 'critical' | 'watch' | 'ok' | 'unknown' | 'anomaly'
-    margin_pct          NUMERIC(6, 2),
+    margin_pct          NUMERIC(10, 2),
     margin_status       TEXT,                       -- 'critical' | 'watch' | 'ok' | 'unknown'
     last_supplier       TEXT,
     UNIQUE (item_code, computed_date)
@@ -380,6 +380,41 @@ FROM party_ledger_entries
 GROUP BY party_name;
 
 COMMENT ON VIEW v_party_outstanding IS 'Party-level outstanding summary. Used by agent for ledger queries.';
+
+
+-- Items sold below purchase cost across multiple invoices
+-- "Prolonged below cost" = sold at a loss 3+ times — likely a deliberate pricing
+-- decision that needs to be reviewed, not just a data anomaly.
+CREATE OR REPLACE VIEW v_below_cost_sales AS
+SELECT
+    s.item_code,
+    si.name                                             AS item_name,
+    si.company                                          AS supplier,
+    COUNT(DISTINCT s.invoice_no)                        AS loss_invoice_count,
+    ROUND(AVG(s.rate)::numeric, 2)                      AS avg_sale_rate,
+    ROUND(AVG(ss.purchase_price)::numeric, 2)           AS avg_purchase_cost,
+    ROUND(AVG(s.rate - ss.purchase_price)::numeric, 2)  AS avg_loss_per_unit,
+    ROUND(SUM((s.rate - ss.purchase_price) * s.qty)::numeric, 0) AS total_loss_value,
+    MIN(s.date)                                         AS first_seen,
+    MAX(s.date)                                         AS last_seen,
+    CASE
+        WHEN COUNT(DISTINCT s.invoice_no) >= 5 THEN 'systematic'   -- Deliberate pricing
+        WHEN COUNT(DISTINCT s.invoice_no) >= 3 THEN 'recurring'    -- Needs review
+        ELSE 'occasional'                                           -- Might be one-off
+    END                                                 AS loss_pattern
+FROM sales_entries s
+JOIN stock_items si ON si.code = s.item_code
+JOIN stock_snapshots ss ON ss.item_code = s.item_code
+WHERE s.category IN ('retail', 'wholesale')
+  AND ss.purchase_price > 0
+  AND s.rate < ss.purchase_price
+GROUP BY s.item_code, si.name, si.company
+HAVING COUNT(DISTINCT s.invoice_no) >= 1
+ORDER BY total_loss_value ASC;  -- Worst losses first
+
+COMMENT ON VIEW v_below_cost_sales IS
+    'Items sold below purchase cost. loss_pattern=systematic means this is '
+    'likely a deliberate pricing decision that should be flagged for review.';
 
 
 -- =============================================================================

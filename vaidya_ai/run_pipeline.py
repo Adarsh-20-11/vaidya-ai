@@ -56,11 +56,11 @@ UPSERT_KEYS = {
     "stock_items":            ["code"],
     "stock_snapshots":        ["item_code", "snapshot_date"],
     "party_ledger_entries":   ["party_name", "date", "voucher_no"],
-    "purchase_entries":       ["invoice_no", "item_code", "date"],
-    "sales_entries":          ["invoice_no", "item_code", "date"],
+    "purchase_entries":       ["invoice_no", "item_code", "date", "batch_no"],
+    "sales_entries":          ["invoice_no", "item_code", "date", "batch_no"],
     "item_velocity":          ["item_code"],
     "item_health":            ["item_code", "computed_date"],
-    "anomalies_today":        ["item_code", "anomaly_type", "detected_date"],
+    "anomalies_today":        ["item_code", "anomaly_type"],
     "supplier_intelligence":  ["supplier", "computed_date"],
     "pipeline_runs":          ["report_id", "ran_at"],
 }
@@ -98,11 +98,22 @@ def run_stock(file_path: str, dry_run: bool, report_date: Optional[date]) -> boo
     logger.info(f"  stock_items: {load_result.rows_upserted} upserted, {load_result.errors}")
 
     # stock_snapshots (daily append)
-    snapshot_cols = ["code", "stock", "cost", "value", "mrp", "purchase_price",
+    # NOTE: 'mrp' belongs on stock_items master (rarely changes), not per-snapshot.
+    # Snapshots track changing values: stock, cost, value, margin.
+    snapshot_cols = ["code", "stock", "cost", "value", "purchase_price",
                      "sales_price", "margin_pct", "is_negative_stock", "supplier_unknown"]
     snap_df = result.data[[c for c in snapshot_cols if c in result.data.columns]].copy()
     snap_df = snap_df.rename(columns={"code": "item_code", "stock": "closing_stock"})
     snap_df["snapshot_date"] = str(report_date or date.today())
+
+    # Cap margin_pct: MRP=0 items produce inf/nan; clamp to ±9999 to be safe
+    # (NUMERIC(10,2) handles up to 99999999.99 after the Supabase ALTER above)
+    if "margin_pct" in snap_df.columns:
+        snap_df["margin_pct"] = (
+            pd.to_numeric(snap_df["margin_pct"], errors="coerce")
+            .clip(-9999, 9999)
+        )
+
     load_result = loader.upsert("stock_snapshots", snap_df, ["item_code", "snapshot_date"])
     logger.info(f"  stock_snapshots: {load_result.rows_upserted} upserted")
 
@@ -114,7 +125,7 @@ def run_stock(file_path: str, dry_run: bool, report_date: Optional[date]) -> boo
 
 
 def run_ledger(file_path: str, dry_run: bool, report_date: Optional[date]) -> bool:
-    logger.info("── Ledger Report ──")
+    logger.info("── Outstanding Ledger ──")
     parser = LedgerParser()
     result = parser.parse(file_path, report_date)
     logger.info(result.summary())
@@ -128,18 +139,19 @@ def run_ledger(file_path: str, dry_run: bool, report_date: Optional[date]) -> bo
         logger.warning(f"  WARN: {w}")
 
     if dry_run:
-        LocalLoader().save("ledger_parsed", result.data, str(report_date))
+        LocalLoader().save("ledger_outstanding", result.data, str(report_date))
         return True
 
     loader = SupabaseLoader()
+    # party_outstanding is a point-in-time snapshot — upsert by party_name
     load_result = loader.upsert(
-        "party_ledger_entries", result.data,
-        ["party_name", "date", "voucher_no"]
+        "party_outstanding", result.data,
+        ["party_name"]
     )
-    logger.info(f"  party_ledger_entries: {load_result.rows_upserted} upserted")
+    logger.info(f"  party_outstanding: {load_result.rows_upserted} upserted")
 
     loader.log_pipeline_run(
-        "ledger", file_path, result.file_hash,
+        "outstanding_ledger", file_path, result.file_hash,
         result.row_count, result.success, result.errors, result.warnings
     )
     return True
@@ -226,7 +238,7 @@ def run_daybook(file_path: str, dry_run: bool, report_date: Optional[date]) -> b
     if not split.sales_entries.empty:
         r = loader.upsert(
             "sales_entries", split.sales_entries,
-            ["invoice_no", "item_code", "date","batch_no"]
+            UPSERT_KEYS["sales_entries"]
         )
         logger.info(f"  sales_entries: {r.rows_upserted} upserted")
 
@@ -234,7 +246,7 @@ def run_daybook(file_path: str, dry_run: bool, report_date: Optional[date]) -> b
     if not split.purchase_entries.empty:
         r = loader.upsert(
             "purchase_entries", split.purchase_entries,
-            ["invoice_no", "item_code", "date", "batch_no"]
+            UPSERT_KEYS["purchase_entries"]
         )
         logger.info(f"  purchase_entries: {r.rows_upserted} upserted")
 
@@ -247,8 +259,12 @@ def run_daybook(file_path: str, dry_run: bool, report_date: Optional[date]) -> b
 
 def run_transform(dry_run: bool) -> bool:
     """
-    Pull latest snapshots from Supabase and compute intelligence tables.
+    Pull data from Supabase and compute intelligence tables.
     Skipped on dry_run (no Supabase data to read).
+
+    Data sources:
+      stock_snapshots → current stock, cost, margin per item
+      sales_entries   → sales_qty per day per item (derived from transactions)
     """
     logger.info("── Intelligence Transform ──")
 
@@ -259,18 +275,165 @@ def run_transform(dry_run: bool) -> bool:
     try:
         from supabase import create_client
         client = create_client(supabase_config.url, supabase_config.key)
-        response = client.table("stock_snapshots").select("*").execute()
-        snapshots = pd.DataFrame(response.data)
+
+        # ── 1. Fetch ALL stock snapshots (paginate past the 1000-row default) ──
+        logger.info("  Fetching stock snapshots...")
+        all_snapshots = []
+        page_size = 1000
+        offset = 0
+        while True:
+            response = (
+                client.table("stock_snapshots")
+                .select("*")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = response.data or []
+            all_snapshots.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        snapshots = pd.DataFrame(all_snapshots)
+        logger.info(f"  Loaded {len(snapshots)} stock snapshots")
+
+        # ── 2. Derive daily sales_qty from sales_entries ──
+        # The stock report is point-in-time — it doesn't have daily movement.
+        # We reconstruct sales_qty per (item_code, date) from actual transactions.
+        # This is the correct source for velocity computation.
+        logger.info("  Fetching sales entries for velocity...")
+        all_sales = []
+        offset = 0
+        while True:
+            response = (
+                client.table("sales_entries")
+                .select("item_code, date, qty")
+                .in_("category", ["retail", "wholesale"])  # exclude returns
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = response.data or []
+            all_sales.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+        if all_sales:
+            sales_df = pd.DataFrame(all_sales)
+            sales_df["date"] = pd.to_datetime(sales_df["date"])
+            sales_df["qty"] = pd.to_numeric(sales_df["qty"], errors="coerce").fillna(0)
+
+            daily_sales = (
+                sales_df.groupby(["item_code", "date"])["qty"]
+                .sum()
+                .reset_index()
+                .rename(columns={"qty": "sales_qty", "date": "snapshot_date"})
+            )
+            logger.info(
+                f"  Derived {len(daily_sales)} item-day sales records "
+                f"from {len(all_sales)} transactions"
+            )
+
+            if snapshots.empty:
+                # No stock snapshots yet — build combined from sales only.
+                # Health will be minimal (no cost/margin data) but velocity works.
+                logger.warning(
+                    "  No stock snapshots — run stock report pipeline first "
+                    "for full health/margin intelligence. Velocity only for now."
+                )
+                combined = daily_sales.copy()
+            else:
+                latest_stock = (
+                    snapshots.sort_values("snapshot_date", ascending=False)
+                    .groupby("item_code")
+                    .first()
+                    .reset_index()
+                )
+                stock_attrs = latest_stock[[
+                    c for c in [
+                        "item_code", "closing_stock", "purchase_price",
+                        "sales_price", "cost", "value", "margin_pct",
+                        "is_negative_stock", "supplier_unknown", "company",
+                    ] if c in latest_stock.columns
+                ]].copy()
+
+                stock_for_merge = stock_attrs.copy()
+                combined = daily_sales.merge(stock_for_merge, on="item_code", how="left")
+                combined["snapshot_date"] = pd.to_datetime(combined["snapshot_date"])
+
+                # Add zero-sales rows for items in stock but not sold in period
+                items_with_sales = set(daily_sales["item_code"].unique())
+                items_without_sales = stock_attrs[
+                    ~stock_attrs["item_code"].isin(items_with_sales)
+                ].copy()
+                items_without_sales["sales_qty"] = 0
+                latest_date = snapshots["snapshot_date"].max()
+                items_without_sales["snapshot_date"] = pd.to_datetime(latest_date)
+
+                combined = pd.concat([combined, items_without_sales], ignore_index=True)
+
+                logger.info(
+                    f"  Combined dataset: {len(combined)} rows across "
+                    f"{combined['item_code'].nunique()} items "
+                    f"({len(items_with_sales)} with sales, "
+                    f"{len(items_without_sales)} without)"
+                )
+        else:
+            # No sales data — fall back to snapshots only (velocity will be null)
+            logger.warning(
+                "  No sales entries found — velocity will be null. "
+                "Load Item Day Book first for meaningful intelligence."
+            )
+            combined = snapshots.copy()
+            combined["sales_qty"] = 0
+
     except Exception as e:
-        logger.error(f"  Failed to fetch snapshots for transform: {e}")
+        logger.error(f"  Failed to fetch data for transform: {e}")
         return False
 
     if snapshots.empty:
         logger.warning("  No snapshot data found — skipping transform")
         return True
 
+    # ── Fetch stock_items dimension table ──
+    # Used by transformer for name-based filtering (dead stock keyword exclusions).
+    # Names are NOT written to output tables — views handle that join at query time.
+    stock_items_dim = None
+    try:
+        si_all = []
+        offset = 0
+        while True:
+            resp = (
+                client.table("stock_items")
+                .select("code,name,company,category")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = resp.data or []
+            si_all.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        if si_all:
+            stock_items_dim = pd.DataFrame(si_all)
+            logger.info(f"  Loaded {len(stock_items_dim)} stock_items for dimension lookup")
+    except Exception as e:
+        logger.warning(f"  Could not load stock_items dimension: {e}")
+
+    # ── Fetch supplier lead times ──
+    suppliers_df = None
+    try:
+        sup_response = client.table("suppliers").select("supplier,lead_time_days,is_active").execute()
+        if sup_response.data:
+            suppliers_df = pd.DataFrame(sup_response.data)
+            if "is_active" in suppliers_df.columns:
+                suppliers_df = suppliers_df[suppliers_df["is_active"] != False]
+            logger.info(f"  Loaded {len(suppliers_df)} supplier lead-time overrides")
+    except Exception as e:
+        logger.info(f"  No suppliers table yet (using default lead time = 2 days): {e}")
+
     transformer = StockTransformer()
-    result = transformer.transform(snapshots)
+    logger.info(f"  Passing {len(combined)} rows ({combined['item_code'].nunique()} unique items) to transformer")
+    result = transformer.transform(combined, suppliers=suppliers_df, stock_items=stock_items_dim)
 
     if not result.success:
         for e in result.errors:
@@ -280,10 +443,12 @@ def run_transform(dry_run: bool) -> bool:
     loader = SupabaseLoader()
     for table_name, df in result.tables.items():
         if df.empty:
+            logger.info(f"  {table_name}: skipped (empty)")
             continue
+        logger.info(f"  {table_name}: sending {len(df)} rows to Supabase...")
         conflict_cols = UPSERT_KEYS.get(table_name, ["item_code"])
         load_result = loader.upsert(table_name, df, conflict_cols)
-        logger.info(f"  {table_name}: {load_result.rows_upserted} upserted")
+        logger.info(f"  {table_name}: {load_result.rows_upserted} upserted, errors={load_result.errors}")
 
     return True
 
@@ -310,7 +475,7 @@ def main():
     export_dir = Path(pipeline_config.export_dir)
     success = True
 
-    def find_file(prefix: str, extensions: tuple = (".xlsx",".xls",".csv")) -> Optional[str]:
+    def find_file(prefix: str, extensions: tuple = (".xlsx",".xls",".csv",".XLSX",".XLS",".CSV")) -> Optional[str]:
         """Find a matching file in export_dir. Defaults to .xlsx; daybook uses .csv."""
         if args.file:
             return args.file
@@ -331,7 +496,7 @@ def main():
             logger.warning("No stock file found in export directory")
 
     if args.report in ("all", "ledger"):
-        f = find_file("ledger")
+        f = find_file("ledger", extensions=(".xls", ".xlsx", ".csv"))
         if f:
             success &= run_ledger(f, dry_run, report_date)
         else:
